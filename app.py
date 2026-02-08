@@ -6,14 +6,13 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 import dash
 import dash_bootstrap_components as dbc
-from dash import dcc, html, Input, Output
+from dash import dcc, html, Input, Output, State
 import plotly.graph_objects as go
 import webbrowser
 
 # =====================================================
 # DATEN LADEN
 # =====================================================
-# Nutzt die kleine, reduzierte CSV direkt aus GitHub oder lokal
 file_path = r"data/Aktuell_Deutschland_SarsCov2_Infektionen_total.csv"
 df = pd.read_csv(file_path, parse_dates=["Meldedatum"])
 
@@ -77,7 +76,6 @@ def fit_parameters(model_func, y0, t_train, I_train, N, sigma=0, gamma=1/10, ome
 
         scale = max(I_train)/(max(I_model)+1e-6)
         I_model *= scale
-
         return np.mean((I_model - I_train)**2)
 
     res = minimize(loss, x0=[0.4,0,0], bounds=[(0,2),(-0.05,0.05),(-0.001,0.001)])
@@ -91,8 +89,26 @@ server = app.server
 
 app.layout = dbc.Container(fluid=True, children=[
 
+    # --- Info Modal ---
+    dbc.Modal(
+        [
+            dbc.ModalHeader("Informationen zur Simulation"),
+            dbc.ModalBody(
+                "PLACEHOLDER: Hier steht ein erläuternder Fließtext über das Modell, "
+                "die Parameter, die Datenbasis, die Bedeutung von R(t) und Hinweise zur Interpretation der Prognosen."
+            ),
+            dbc.ModalFooter(
+                dbc.Button("Schließen", id="close_info", n_clicks=0)
+            ),
+        ],
+        id="modal_info",
+        is_open=False
+    ),
+
+    # --- Überschrift ---
     dbc.Row(dbc.Col(html.H2("Dynamisches Modell COVID (Deutschland gesamt)", className="text-center my-3"))),
 
+    # --- Haupt-Layout ---
     dbc.Row([
 
         # Sidebar
@@ -120,25 +136,23 @@ app.layout = dbc.Container(fluid=True, children=[
                     html.Label("Fit Datenbasis"),
                     dcc.RadioItems(
                         id="fit_mode",
-                        options=[
-                            {"label":"Rohdaten","value":"raw"},
-                            {"label":"7-Tage-Mittel","value":"smooth"}
-                        ],
+                        options=[{"label":"Rohdaten","value":"raw"},
+                                 {"label":"7-Tage-Mittel","value":"smooth"}],
                         value="smooth",
                         inline=True
                     ),
 
                     html.Br(),
                     html.Label("Population"),
-                    dcc.Slider(id="population",min=0,max=83000000,step=1000,value=5000), # Deutschland gesamt
+                    dcc.Slider(id="population", min=1000, max=83000000, step=1000, value=83000000),
 
                     html.Br(),
                     html.Label("I₀"),
-                    dcc.Slider(id="I0",min=0,max=10000,step=10,value=20),
+                    dcc.Slider(id="I0", min=0, max=10000, step=10, value=100),
 
                     html.Br(),
                     html.Label("Train Split (%)"),
-                    dcc.Slider(id="split_ratio",min=10,max=90,step=5,value=70),
+                    dcc.Slider(id="split_ratio", min=10, max=90, step=5, value=70),
 
                     html.Br(),
                     html.Label("R(t) anzeigen"),
@@ -148,6 +162,9 @@ app.layout = dbc.Container(fluid=True, children=[
                         value=[],  # leer = standardmäßig aus
                         inline=True
                     ),
+
+                    html.Br(),
+                    dbc.Button("Info zur Simulation", id="open_info", n_clicks=0, color="info"),
 
                 ])
             ])
@@ -160,7 +177,7 @@ app.layout = dbc.Container(fluid=True, children=[
 ])
 
 # =====================================================
-# CALLBACK
+# Callback für Simulation Plot
 # =====================================================
 @app.callback(
     Output("simulation_plot","figure"),
@@ -170,12 +187,12 @@ app.layout = dbc.Container(fluid=True, children=[
     Input("population","value"),
     Input("I0","value"),
     Input("split_ratio","value"),
-    Input("fit_mode","value")
+    Input("fit_mode","value"),
     Input("show_rt", "value")
 )
 def update_simulation(start,end,model_type,N,I0,split_ratio,fit_mode,show_rt):
 
-    # Daten filtern (nur nach Datum)
+    # Daten filtern
     df_period = df[(df["Meldedatum"]>=start) & (df["Meldedatum"]<=end)]
     daily = df_period.groupby("Meldedatum")["AnzahlFall"].sum().sort_index()
     dates = daily.index
@@ -184,13 +201,11 @@ def update_simulation(start,end,model_type,N,I0,split_ratio,fit_mode,show_rt):
     if len(I_real)<30:
         return go.Figure()
 
-    # 7-Tage-Mittel immer berechnen
+    # 7-Tage-Mittel
     I_smooth = smooth_series(I_real,7)
-
-    # Fit-Daten bestimmen (Rohdaten oder geglättet)
     I_used = I_smooth if fit_mode=="smooth" else I_real.copy()
 
-    # Daten aufteilen
+    # Split Train/Test
     split_idx = int(len(I_real)*split_ratio/100)
     I_train = I_used[:split_idx]
     I_test  = I_real[split_idx:]
@@ -208,85 +223,63 @@ def update_simulation(start,end,model_type,N,I0,split_ratio,fit_mode,show_rt):
 
     b0,b1,b2 = fit_parameters(model_func,y0,t_train,I_train,N,sigma,gamma,omega)
 
-    # simulate
+    # Simulation
     if model_type=="SIR":
         sol = odeint(SIR,y0,t_total,args=(b0,b1,b2,gamma,N))
         I_model = sol[:,1]
     else:
-        sol = odeint(model_func,y0,t_total,args=(b0,b1,b2,sigma,gamma,N) if model_type=="SEIR"
-                     else (b0,b1,b2,sigma,gamma,omega,N))
+        sol = odeint(model_func,y0,t_total,
+                     args=(b0,b1,b2,sigma,gamma,N) if model_type=="SEIR" else
+                          (b0,b1,b2,sigma,gamma,omega,N))
         I_model = sol[:,2]
 
+    # Skalierung
     scale = max(I_train)/(max(I_model[:split_idx])+1e-6)
     I_model *= scale
 
+    # Fehlerberechnung
     rmse = np.sqrt(mean_squared_error(I_test,I_model[split_idx:]))
     mae = mean_absolute_error(I_test,I_model[split_idx:])
 
     # R(t)
     R_t = beta_time(t_total,b0,b1,b2)/gamma
 
-    # plot
+    # --- Plot ---
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=dates,y=I_real,mode="markers",name="Rohdaten",opacity=0.4))
+    fig.add_trace(go.Scatter(x=dates, y=I_real, mode="markers", name="Rohdaten", opacity=0.4))
     fig.add_trace(go.Scatter(x=dates, y=I_smooth, mode="lines", name="7-Tage-Mittel"))
-    fig.add_trace(go.Scatter(
-        x=dates,
-        y=I_model,
-        mode="lines",
-        name="Modell",
-        line=dict(color="red", width=3)
-    ))
-    if "yes" in show_rt:
-        fig.add_trace(go.Scatter(
-            x=dates,
-            y=R_t,
-            mode="lines",
-            name="R(t)",
-            yaxis="y2",
-            line=dict(color="green", width=3)
-        ))
+    fig.add_trace(go.Scatter(x=dates, y=I_model, mode="lines", name="Modell", line=dict(color="red", width=3)))
 
+    if "yes" in show_rt:
+        fig.add_trace(go.Scatter(x=dates, y=R_t, mode="lines", name="R(t)", yaxis="y2", line=dict(color="green", width=3)))
 
     cut_date = dates[split_idx]
 
-    # Grauer Prognosebereich
-    fig.add_vrect(
-        x0=cut_date,
-        x1=dates[-1],
-        fillcolor="rgba(150,150,150,0.15)",
-        layer="below",
-        line_width=0,
-    )
+    # Prognosebereich
+    fig.add_vrect(x0=cut_date, x1=dates[-1], fillcolor="rgba(150,150,150,0.15)", layer="below", line_width=0)
+    fig.add_vline(x=cut_date, line_width=3, line_dash="dash", line_color="black")
+    fig.add_annotation(x=cut_date, y=max(I_real), text="Train → Prognose", showarrow=False, yshift=20, font=dict(size=14,color="black"), bgcolor="white")
 
-    # Vertikale Trennlinie
-    fig.add_vline(
-        x=cut_date,
-        line_width=3,
-        line_dash="dash",
-        line_color="black"
-    )
-
-    # Beschriftungen
-    fig.add_annotation(
-        x=cut_date,
-        y=max(I_real),
-        text="Train → Prognose",
-        showarrow=False,
-        yshift=20,
-        font=dict(size=14,color="black"),
-        bgcolor="white"
-    )
-
-    fig.update_layout(
-        title=f"{model_type} | RMSE={rmse:.1f} MAE={mae:.1f}",
-        yaxis_title="Infektionen",
-        yaxis2=dict(title="R(t)",overlaying="y",side="right"),
-        template="plotly_dark",
-        hovermode="x unified"
-    )
-
+    fig.update_layout(title=f"{model_type} | RMSE={rmse:.1f} MAE={mae:.1f}",
+                      yaxis_title="Infektionen",
+                      yaxis2=dict(title="R(t)",overlaying="y",side="right"),
+                      template="plotly_dark",
+                      hovermode="x unified")
     return fig
+
+# =====================================================
+# Callback für Modal
+# =====================================================
+@app.callback(
+    Output("modal_info","is_open"),
+    Input("open_info","n_clicks"),
+    Input("close_info","n_clicks"),
+    State("modal_info","is_open")
+)
+def toggle_modal(n1,n2,is_open):
+    if n1 or n2:
+        return not is_open
+    return is_open
 
 # =====================================================
 if __name__=="__main__":
