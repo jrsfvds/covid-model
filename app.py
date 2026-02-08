@@ -87,6 +87,7 @@ def fit_parameters(model_func, y0, t_train, I_train, N, sigma=0, gamma=1/10, ome
 # DASH APP
 # =====================================================
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
+server = app.server
 
 app.layout = dbc.Container(fluid=True, children=[
 
