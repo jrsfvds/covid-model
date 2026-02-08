@@ -94,8 +94,12 @@ app.layout = dbc.Container(fluid=True, children=[
         [
             dbc.ModalHeader("Informationen zur Simulation"),
             dbc.ModalBody(
-                "PLACEHOLDER: Hier steht ein erläuternder Fließtext über das Modell, "
-                "die Parameter, die Datenbasis, die Bedeutung von R(t) und Hinweise zur Interpretation der Prognosen."
+                dbc.Container(
+                "PLACEHOLDER: Hier steht ein ausführlicher erläuternder Fließtext über das Modell, "
+                "Parameter, Datenbasis, R(t) und Hinweise zur Interpretation. "
+                "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 10,  # Platzhaltertext
+                style={"maxHeight": "60vh", "overflowY": "auto"}  # Scrollbar
+                )
             ),
             dbc.ModalFooter(
                 dbc.Button("Schließen", id="close_info", n_clicks=0)
@@ -144,11 +148,13 @@ app.layout = dbc.Container(fluid=True, children=[
 
                     html.Br(),
                     html.Label("Population"),
-                    dcc.Slider(id="population", min=1000, max=83000000, step=1000, value=83000000),
+                    dcc.Slider(id="population", min=1000, max=83000000, step=1000, value=83000),
+                    html.Div(id="population_value", style={"marginBottom":"10px"}),  # Wert anzeigen
 
                     html.Br(),
                     html.Label("I₀"),
                     dcc.Slider(id="I0", min=0, max=10000, step=10, value=100),
+                    html.Div(id="I0_value", style={"marginBottom":"10px"}),  # Wert anzeigen
 
                     html.Br(),
                     html.Label("Train Split (%)"),
@@ -280,6 +286,19 @@ def toggle_modal(n1,n2,is_open):
     if n1 or n2:
         return not is_open
     return is_open
+
+# =====================================================
+# Callback für Population- und I₀-Werteanzeige
+# =====================================================
+@app.callback(
+    Output("population_value","children"),
+    Output("I0_value","children"),
+    Input("population","value"),
+    Input("I0","value")
+)
+def update_slider_labels(pop, I0):
+    return f"Population: {pop:,}", f"I₀: {I0:,}"
+
 
 # =====================================================
 if __name__=="__main__":
