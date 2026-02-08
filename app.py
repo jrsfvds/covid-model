@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 from scipy.integrate import odeint
@@ -8,37 +9,36 @@ import dash
 import dash_bootstrap_components as dbc
 from dash import dcc, html, Input, Output
 import plotly.graph_objects as go
-import webbrowser
-
-# =====================================================
-# DATEN LADEN
-# =====================================================
-import os
 import requests
-import pandas as pd
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(BASE_DIR, "data")
-CSV_PATH = os.path.join(DATA_PATH, "Aktuell_Deutschland_SarsCov2_Infektionen.csv")
-
+# =====================================================
+# DATEN LADEN (nur relevante Spalten)
+# =====================================================
+DATA_PATH = "data"
 os.makedirs(DATA_PATH, exist_ok=True)
 
-# Zenodo‑Download (RKI COVID‑Daten)
-ZENODO_URL = "https://zenodo-rdm.web.cern.ch/records/17115262/files/Aktuell_Deutschland_SarsCov2_Infektionen.csv?download=1"
+RKI_URL = ("https://services7.arcgis.com/mOBPykOjAyBO2ZKk/"
+           "arcgis/rest/services/RKI_COVID19/FeatureServer/0/query?"
+           "where=1=1&outFields=Meldedatum,AnzahlFall,IdLandkreis&outSR=4326&f=csv")
 
+CSV_PATH = os.path.join(DATA_PATH, "RKI_COVID19.csv")
+
+# Download nur, wenn Datei nicht existiert
 if not os.path.exists(CSV_PATH):
-    print("Downloading RKI dataset from Zenodo…")
-    r = requests.get(ZENODO_URL, stream=True)
+    print("Downloading RKI CSV from ArcGIS API...")
+    r = requests.get(RKI_URL, stream=True)
     r.raise_for_status()
     with open(CSV_PATH, "wb") as f:
         for chunk in r.iter_content(chunk_size=8192):
             f.write(chunk)
 
-df = pd.read_csv(CSV_PATH, parse_dates=["Meldedatum"])
+# CSV einlesen (nur relevante Spalten)
+df = pd.read_csv(CSV_PATH, usecols=["Meldedatum","AnzahlFall","IdLandkreis"],
+                 parse_dates=["Meldedatum"])
 
-
-
-
+# =====================================================
+# REGIONS
+# =====================================================
 REGIONS = {
     "Stuttgart": 8111,
     "München": 9162,
@@ -46,14 +46,11 @@ REGIONS = {
 }
 
 # =====================================================
-# SMOOTHING
+# HILFSFUNKTIONEN
 # =====================================================
 def smooth_series(data, window=7):
     return pd.Series(data).rolling(window, center=True, min_periods=1).mean().values
 
-# =====================================================
-# DYNAMISCHES BETA
-# =====================================================
 def beta_time(t, b0, b1, b2):
     return np.clip(b0 + b1*t + b2*t*t, 0, 2)
 
@@ -90,10 +87,8 @@ def SEIRS(y, t, b0, b1, b2, sigma, gamma, omega, N):
 # PARAMETER FIT
 # =====================================================
 def fit_parameters(model_func, y0, t_train, I_train, N, sigma=0, gamma=1/10, omega=0):
-
     def loss(params):
         b0,b1,b2 = params
-
         if model_func == SIR:
             sol = odeint(model_func, y0, t_train, args=(b0,b1,b2,gamma,N))
             I_model = sol[:,1]
@@ -106,7 +101,6 @@ def fit_parameters(model_func, y0, t_train, I_train, N, sigma=0, gamma=1/10, ome
 
         scale = max(I_train)/(max(I_model)+1e-6)
         I_model *= scale
-
         return np.mean((I_model - I_train)**2)
 
     res = minimize(loss, x0=[0.4,0,0], bounds=[(0,2),(-0.05,0.05),(-0.001,0.001)])
@@ -122,12 +116,9 @@ app.layout = dbc.Container(fluid=True, children=[
     dbc.Row(dbc.Col(html.H2("Dynamisches SEIRS Modell COVID", className="text-center my-3"))),
 
     dbc.Row([
-
-        # Sidebar
         dbc.Col([
             dbc.Card([
                 dbc.CardBody([
-
                     html.Label("Region"),
                     dcc.Dropdown(
                         id="region",
@@ -140,8 +131,8 @@ app.layout = dbc.Container(fluid=True, children=[
                     html.Label("Zeitraum"),
                     dcc.DatePickerRange(
                         id="date_range",
-                        start_date="2020-09-15",
-                        end_date="2021-02-15"
+                        start_date=df["Meldedatum"].min(),
+                        end_date=df["Meldedatum"].max()
                     ),
 
                     html.Br(),
@@ -176,14 +167,11 @@ app.layout = dbc.Container(fluid=True, children=[
                     html.Br(),
                     html.Label("Train Split (%)"),
                     dcc.Slider(id="split_ratio",min=10,max=90,step=5,value=70),
-
                 ])
             ])
         ], width=3),
 
-        # Plot
         dbc.Col(dcc.Graph(id="simulation_plot"), width=9)
-
     ])
 ])
 
@@ -202,8 +190,7 @@ app.layout = dbc.Container(fluid=True, children=[
     Input("fit_mode","value")
 )
 def update_simulation(region_id,start,end,model_type,N,I0,split_ratio,fit_mode):
-
-    # Daten filtern
+    # Filter Daten
     if region_id == 0:
         df_period = df[(df["Meldedatum"]>=start)&(df["Meldedatum"]<=end)]
     else:
@@ -217,23 +204,16 @@ def update_simulation(region_id,start,end,model_type,N,I0,split_ratio,fit_mode):
     if len(I_real)<30:
         return go.Figure()
 
-    # 7-Tage-Mittel immer berechnen (für den Plot)
     I_smooth = smooth_series(I_real,7)
-
-    # Fit-Daten bestimmen (Rohdaten oder geglättet)
     I_used = I_smooth if fit_mode=="smooth" else I_real.copy()
 
-    # Daten aufteilen
     split_idx = int(len(I_real)*split_ratio/100)
     I_train = I_used[:split_idx]
     I_test  = I_real[split_idx:]
-
-
     t_train = np.arange(len(I_train))
     t_total = np.arange(len(I_real))
 
     gamma, sigma, omega = 1/10, 1/5, 1/180
-
     E0, R0 = 2*I0, 0
     S0 = N-I0-E0
 
@@ -243,7 +223,7 @@ def update_simulation(region_id,start,end,model_type,N,I0,split_ratio,fit_mode):
 
     b0,b1,b2 = fit_parameters(model_func,y0,t_train,I_train,N,sigma,gamma,omega)
 
-    # simulate
+    # Simulation
     if model_type=="SIR":
         sol = odeint(SIR,y0,t_total,args=(b0,b1,b2,gamma,N))
         I_model = sol[:,1]
@@ -257,80 +237,31 @@ def update_simulation(region_id,start,end,model_type,N,I0,split_ratio,fit_mode):
 
     rmse = np.sqrt(mean_squared_error(I_test,I_model[split_idx:]))
     mae = mean_absolute_error(I_test,I_model[split_idx:])
-
-    # R(t)
     R_t = beta_time(t_total,b0,b1,b2)/gamma
 
-    # plot
+    # Plot
     fig = go.Figure()
-
     fig.add_trace(go.Scatter(x=dates,y=I_real,mode="markers",name="Rohdaten",opacity=0.4))
-
-    # 7-Tage-Mittel immer anzeigen
     fig.add_trace(go.Scatter(x=dates, y=I_smooth, mode="lines", name="7-Tage-Mittel"))
-
-
-    fig.add_trace(go.Scatter(
-    x=dates,
-    y=I_model,
-    mode="lines",
-    name="Modell",
-    line=dict(color="red", width=3)
-    ))
-
-    fig.add_trace(go.Scatter(
-    x=dates,
-    y=R_t,
-    mode="lines",
-    name="R(t)",
-    yaxis="y2",
-    line=dict(color="green", width=3)
-    ))
-
+    fig.add_trace(go.Scatter(x=dates,y=I_model,mode="lines",name="Modell",line=dict(color="red", width=3)))
+    fig.add_trace(go.Scatter(x=dates,y=R_t,mode="lines",name="R(t)",yaxis="y2",line=dict(color="green", width=3)))
 
     cut_date = dates[split_idx]
+    fig.add_vrect(x0=cut_date, x1=dates[-1], fillcolor="rgba(150,150,150,0.15)", layer="below", line_width=0)
+    fig.add_vline(x=cut_date, line_width=3, line_dash="dash", line_color="black")
+    fig.add_annotation(x=cut_date, y=max(I_real), text="Train → Prognose", showarrow=False,
+                       yshift=20, font=dict(size=14,color="black"), bgcolor="white")
 
-    # Grauer Prognosebereich
-    fig.add_vrect(
-        x0=cut_date,
-        x1=dates[-1],
-        fillcolor="rgba(150,150,150,0.15)",
-        layer="below",
-        line_width=0,
-    )
-
-    # Vertikale Trennlinie
-    fig.add_vline(
-        x=cut_date,
-        line_width=3,
-        line_dash="dash",
-        line_color="black"
-    )
-
-    # Beschriftungen
-    fig.add_annotation(
-        x=cut_date,
-        y=max(I_real),
-        text="Train → Prognose",
-        showarrow=False,
-        yshift=20,
-        font=dict(size=14,color="black"),
-        bgcolor="white"
-    )
-
-    fig.update_layout(
-        title=f"{model_type} | RMSE={rmse:.1f} MAE={mae:.1f}",
-        yaxis_title="Infektionen",
-        yaxis2=dict(title="R(t)",overlaying="y",side="right"),
-        template="plotly_dark",
-        hovermode="x unified"
-    )
+    fig.update_layout(title=f"{model_type} | RMSE={rmse:.1f} MAE={mae:.1f}",
+                      yaxis_title="Infektionen",
+                      yaxis2=dict(title="R(t)",overlaying="y",side="right"),
+                      template="plotly_dark",
+                      hovermode="x unified")
 
     return fig
 
 # =====================================================
-server = app.server
-
-if __name__ == "__main__":
-    app.run(debug=False)
-
+# MAIN
+# =====================================================
+if __name__=="__main__":
+    app.run_server(debug=True)
