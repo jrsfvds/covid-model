@@ -15,10 +15,7 @@ import webbrowser
 # =====================================================
 import os
 import requests
-import zipfile
-import io
-
-DATA_URL = "https://www.arcgis.com/sharing/rest/content/items/f10774f1c63e40168479a1feb6c7ca74/data"
+import pandas as pd
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(BASE_DIR, "data")
@@ -26,18 +23,20 @@ CSV_PATH = os.path.join(DATA_PATH, "rki.csv")
 
 os.makedirs(DATA_PATH, exist_ok=True)
 
+# URL für tägliche Fallzahlen RKI (CSV direkt)
+DATA_URL = "https://opendata.arcgis.com/datasets/f10774f1c63e40168479a1feb6c7ca74_0.csv"
+
+# Datei nur herunterladen, wenn sie noch nicht existiert
 if not os.path.exists(CSV_PATH):
-    print("Downloading RKI dataset...")
+    print("Downloading RKI CSV...")
     r = requests.get(DATA_URL)
-    z = zipfile.ZipFile(io.BytesIO(r.content))
-    z.extractall(DATA_PATH)
+    r.raise_for_status()  # Fehler, falls Download fehlschlägt
+    with open(CSV_PATH, "wb") as f:
+        f.write(r.content)
 
-    # CSV finden
-    for f in os.listdir(DATA_PATH):
-        if f.endswith(".csv"):
-            os.rename(os.path.join(DATA_PATH, f), CSV_PATH)
-
+# CSV einlesen
 df = pd.read_csv(CSV_PATH, parse_dates=["Meldedatum"])
+
 
 
 REGIONS = {
