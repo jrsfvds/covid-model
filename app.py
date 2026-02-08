@@ -19,22 +19,23 @@ import pandas as pd
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(BASE_DIR, "data")
-CSV_PATH = os.path.join(DATA_PATH, "rki.csv")
+CSV_PATH = os.path.join(DATA_PATH, "Aktuell_Deutschland_SarsCov2_Infektionen.csv")
 
 os.makedirs(DATA_PATH, exist_ok=True)
 
-DATA_URL = "https://github.com/robert-koch-institut/COVID-19-Fallzahlen/raw/master/Time_series/COVID-19_Fallzahlen_deutschland.csv"
+# Zenodo‑Download (RKI COVID‑Daten)
+ZENODO_URL = "https://zenodo-rdm.web.cern.ch/records/17115262/files/Aktuell_Deutschland_SarsCov2_Infektionen.csv?download=1"
 
-# Datei nur herunterladen, wenn sie noch nicht existiert
 if not os.path.exists(CSV_PATH):
-    print("Downloading RKI CSV from GitHub...")
-    r = requests.get(DATA_URL)
-    r.raise_for_status()  # stoppt bei Fehler
+    print("Downloading RKI dataset from Zenodo…")
+    r = requests.get(ZENODO_URL, stream=True)
+    r.raise_for_status()
     with open(CSV_PATH, "wb") as f:
-        f.write(r.content)
+        for chunk in r.iter_content(chunk_size=8192):
+            f.write(chunk)
 
-# CSV einlesen
 df = pd.read_csv(CSV_PATH, parse_dates=["Meldedatum"])
+
 
 
 
