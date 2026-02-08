@@ -91,7 +91,7 @@ server = app.server
 
 app.layout = dbc.Container(fluid=True, children=[
 
-    dbc.Row(dbc.Col(html.H2("Dynamisches SEIRS Modell COVID (Deutschland gesamt)", className="text-center my-3"))),
+    dbc.Row(dbc.Col(html.H2("Dynamisches Modell COVID (Deutschland gesamt)", className="text-center my-3"))),
 
     dbc.Row([
 
@@ -130,15 +130,24 @@ app.layout = dbc.Container(fluid=True, children=[
 
                     html.Br(),
                     html.Label("Population"),
-                    dcc.Slider(id="population",min=0,max=1000000,step=5000,value=83000000), # Deutschland gesamt
+                    dcc.Slider(id="population",min=0,max=83000000,step=1000,value=5000), # Deutschland gesamt
 
                     html.Br(),
                     html.Label("I₀"),
-                    dcc.Slider(id="I0",min=0,max=10000,step=10,value=100),
+                    dcc.Slider(id="I0",min=0,max=10000,step=10,value=20),
 
                     html.Br(),
                     html.Label("Train Split (%)"),
                     dcc.Slider(id="split_ratio",min=10,max=90,step=5,value=70),
+
+                    html.Br(),
+                    html.Label("R(t) anzeigen"),
+                    dcc.Checklist(
+                        id="show_rt",
+                        options=[{"label": "Ja", "value": "yes"}],
+                        value=[],  # leer = standardmäßig aus
+                        inline=True
+                    ),
 
                 ])
             ])
@@ -162,8 +171,9 @@ app.layout = dbc.Container(fluid=True, children=[
     Input("I0","value"),
     Input("split_ratio","value"),
     Input("fit_mode","value")
+    Input("show_rt", "value")
 )
-def update_simulation(start,end,model_type,N,I0,split_ratio,fit_mode):
+def update_simulation(start,end,model_type,N,I0,split_ratio,fit_mode,show_rt):
 
     # Daten filtern (nur nach Datum)
     df_period = df[(df["Meldedatum"]>=start) & (df["Meldedatum"]<=end)]
@@ -227,14 +237,16 @@ def update_simulation(start,end,model_type,N,I0,split_ratio,fit_mode):
         name="Modell",
         line=dict(color="red", width=3)
     ))
-    fig.add_trace(go.Scatter(
-        x=dates,
-        y=R_t,
-        mode="lines",
-        name="R(t)",
-        yaxis="y2",
-        line=dict(color="green", width=3)
-    ))
+    if "yes" in show_rt:
+        fig.add_trace(go.Scatter(
+            x=dates,
+            y=R_t,
+            mode="lines",
+            name="R(t)",
+            yaxis="y2",
+            line=dict(color="green", width=3)
+        ))
+
 
     cut_date = dates[split_idx]
 
