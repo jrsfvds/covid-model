@@ -14,9 +14,31 @@ import webbrowser
 # DATEN LADEN
 # =====================================================
 import os
+import requests
+import zipfile
+import io
+
+DATA_URL = "https://www.arcgis.com/sharing/rest/content/items/f10774f1c63e40168479a1feb6c7ca74/data"
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-file_path = os.path.join(BASE_DIR, "data", "Aktuell_Deutschland_SarsCov2_Infektionen.csv")
-df = pd.read_csv(file_path, parse_dates=["Meldedatum"])
+DATA_PATH = os.path.join(BASE_DIR, "data")
+CSV_PATH = os.path.join(DATA_PATH, "rki.csv")
+
+os.makedirs(DATA_PATH, exist_ok=True)
+
+if not os.path.exists(CSV_PATH):
+    print("Downloading RKI dataset...")
+    r = requests.get(DATA_URL)
+    z = zipfile.ZipFile(io.BytesIO(r.content))
+    z.extractall(DATA_PATH)
+
+    # CSV finden
+    for f in os.listdir(DATA_PATH):
+        if f.endswith(".csv"):
+            os.rename(os.path.join(DATA_PATH, f), CSV_PATH)
+
+df = pd.read_csv(CSV_PATH, parse_dates=["Meldedatum"])
+
 
 REGIONS = {
     "Stuttgart": 8111,
