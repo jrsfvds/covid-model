@@ -23,14 +23,13 @@ CSV_PATH = os.path.join(DATA_PATH, "rki.csv")
 
 os.makedirs(DATA_PATH, exist_ok=True)
 
-# URL für tägliche Fallzahlen RKI (CSV direkt)
-DATA_URL = "https://opendata.arcgis.com/datasets/f10774f1c63e40168479a1feb6c7ca74_0.csv"
+DATA_URL = "https://github.com/robert-koch-institut/COVID-19-Fallzahlen/raw/master/Time_series/COVID-19_Fallzahlen_deutschland.csv"
 
 # Datei nur herunterladen, wenn sie noch nicht existiert
 if not os.path.exists(CSV_PATH):
-    print("Downloading RKI CSV...")
+    print("Downloading RKI CSV from GitHub...")
     r = requests.get(DATA_URL)
-    r.raise_for_status()  # Fehler, falls Download fehlschlägt
+    r.raise_for_status()  # stoppt bei Fehler
     with open(CSV_PATH, "wb") as f:
         f.write(r.content)
 
