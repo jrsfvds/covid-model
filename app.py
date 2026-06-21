@@ -15,6 +15,8 @@
 # https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.differential_evolution.html
 # =============================================================================
 
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -29,7 +31,15 @@ from scipy.optimize import differential_evolution
 
 # Path to the CSV file from the RKI - this one is compressed to only "Anzahl_Fall" category
 # and is quicker, if all the categories are kept it takes much longer
-FILE_PATH = r"data/Aktuell_Deutschland_SarsCov2_Infektionen_total.csv"
+#
+# Resolved relative to THIS FILE's location (not the process's working
+# directory). A plain relative path like "data/...csv" only works if the
+# process is launched from exactly the right folder — gunicorn on Render
+# (and other WSGI hosts) does not guarantee that, which silently breaks
+# the import. Anchoring to __file__ makes this work the same way locally
+# (python app.py), under gunicorn, and on any other host.
+_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+FILE_PATH = os.path.join(_MODULE_DIR, "data", "Aktuell_Deutschland_SarsCov2_Infektionen_total.csv")
 
 # ---- The fixed (non-optimised) epidemiological parameters ----------------------------------------
 #
@@ -84,6 +94,17 @@ DE_POLISH = True       # local L-BFGS-B optimization after global search
 
 def load_data(file_path: str = FILE_PATH) -> pd.DataFrame:
     """Load the RKI case data CSV, parsing the report date column."""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(
+            f"RKI case data CSV not found at: {file_path}\n"
+            "Make sure the 'data' folder (containing "
+            "'Aktuell_Deutschland_SarsCov2_Infektionen_total.csv') is deployed "
+            "alongside this module, e.g.:\n"
+            "  <project_root>/\n"
+            "    app.py\n"
+            "    covid_model_local_Experimental_Beta_Relative_differentialEvolution.py\n"
+            "    data/Aktuell_Deutschland_SarsCov2_Infektionen_total.csv"
+        )
     return pd.read_csv(file_path, parse_dates=["Meldedatum"])
 
 
