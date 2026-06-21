@@ -10,8 +10,9 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 import dash
 import dash_bootstrap_components as dbc
-from dash import dcc, html, Input, Output, State, callback_context
+from dash import dcc, html, Input, Output, State, callback_context, DiskcacheManager
 import plotly.graph_objects as go
+import diskcache
 import webbrowser
 
 # =====================================================
@@ -318,7 +319,33 @@ def fit_parameters(model_func, t_train, I_train, beta_mode,
 def _build_app():
     """Build and return (app, server). May raise — caller handles fallback."""
 
-    app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
+    # -------------------------------------------------
+    # BACKGROUND CALLBACK MANAGER
+    # -------------------------------------------------
+    # The differential_evolution fit can legitimately take from a few
+    # seconds up to several minutes depending on the maxiter/popsize
+    # sliders. Running it inline inside a normal callback blocks the HTTP
+    # request for that whole duration — on a production WSGI server
+    # (gunicorn etc.) the worker gets killed once it exceeds the server's
+    # request timeout (commonly ~30s), which looks to the user like the
+    # page silently "reverting" with no error shown.
+    #
+    # DiskcacheManager runs the callback in a separate forked process; the
+    # HTTP request returns immediately and the frontend polls for the
+    # result, so no request-timeout ever applies to the optimisation
+    # itself. This relies on the OS "fork" start method (default on Linux,
+    # e.g. Render/Heroku/most containers) to share the running process's
+    # memory — it will NOT work with Python's "spawn" start method
+    # (default on Windows/macOS) because update_simulation is a nested
+    # closure, not a top-level/picklable function.
+    cache = diskcache.Cache("./cache")
+    background_callback_manager = DiskcacheManager(cache)
+
+    app = dash.Dash(
+        __name__,
+        external_stylesheets=[dbc.themes.FLATLY],
+        background_callback_manager=background_callback_manager,
+    )
     server = app.server
 
     # -------------------------------------------------
@@ -465,6 +492,10 @@ def _build_app():
                         dbc.Button("Optimierung starten", id="run_optimization",
                                    n_clicks=0, color="primary", className="w-100"),
 
+                        dbc.Button("Abbrechen", id="cancel_optimization",
+                                   n_clicks=0, color="danger", outline=True,
+                                   className="w-100 mt-2", disabled=True),
+
                         html.Br(), html.Br(),
                         dbc.Button("Info zur Simulation", id="open_info",
                                    n_clicks=0, color="info", outline=True, className="w-100"),
@@ -505,6 +536,13 @@ def _build_app():
         State("show_rt", "value"),
         State("de_maxiter", "value"),
         State("de_popsize", "value"),
+        background=True,
+        running=[
+            (Output("run_optimization", "disabled"), True, False),
+            (Output("run_optimization", "children"), "Optimierung läuft…", "Optimierung starten"),
+            (Output("cancel_optimization", "disabled"), False, True),
+        ],
+        cancel=[Input("cancel_optimization", "n_clicks")],
         prevent_initial_call=False,
     )
     def update_simulation(n_clicks, start, end, model_type, beta_mode,
@@ -569,86 +607,127 @@ def _build_app():
         model_func = MODEL_MAP[model_type]
 
         # ------------------------------------------------------------------
-        # Globale Optimierung (differential_evolution)
+        # Ab hier kann die Optimierung/Simulation aus vielen Gründen scheitern
+        # (Optimizer liefert keine zulässige Lösung, ODE-Solver divergiert,
+        # NaNs in der Fehlerberechnung, ...). Ein try/except verhindert, dass
+        # ein solcher Fehler nur "im Hintergrund" verpufft und die Oberfläche
+        # stillschweigend beim alten/Platzhalter-Plot bleibt: stattdessen wird
+        # der Fehler direkt sichtbar gemacht (UI) und vollständig geloggt
+        # (Konsole/Terminal).
         # ------------------------------------------------------------------
-        t0 = time.time()
-        beta_params, N_opt, I0_opt, E0_opt = fit_parameters(
-            model_func, t_train, I_train, beta_mode,
-            sigma=SIGMA, gamma=GAMMA, omega=OMEGA,
-            n_min=N_MIN, n_max=N_MAX,
-            de_maxiter=de_maxiter, de_popsize=de_popsize,
-            de_tol=DE_TOL, de_seed=DE_SEED,
-            de_workers=1, de_polish=DE_POLISH,
-        )
-        fit_seconds = time.time() - t0
+        try:
+            # --------------------------------------------------------------
+            # Globale Optimierung (differential_evolution)
+            # --------------------------------------------------------------
+            t0 = time.time()
+            beta_params, N_opt, I0_opt, E0_opt = fit_parameters(
+                model_func, t_train, I_train, beta_mode,
+                sigma=SIGMA, gamma=GAMMA, omega=OMEGA,
+                n_min=N_MIN, n_max=N_MAX,
+                de_maxiter=de_maxiter, de_popsize=de_popsize,
+                de_tol=DE_TOL, de_seed=DE_SEED,
+                de_workers=1, de_polish=DE_POLISH,
+            )
+            fit_seconds = time.time() - t0
 
-        # ------------------------------------------------------------------
-        # Vollständige Simulation mit optimierten Parametern
-        # ------------------------------------------------------------------
-        y0 = build_initial_conditions(model_func, N_opt, I0_opt, E0_opt, R0_init=0)
-        args = build_args(model_func, beta_params, beta_mode, SIGMA, GAMMA, OMEGA, N_opt)
-        sol = run_model(model_func, y0, t_total, args, tight=True)
-        I_model = extract_I(model_func, sol)
+            # --------------------------------------------------------------
+            # Vollständige Simulation mit optimierten Parametern
+            # --------------------------------------------------------------
+            y0 = build_initial_conditions(model_func, N_opt, I0_opt, E0_opt, R0_init=0)
+            if y0 is None:
+                raise RuntimeError(
+                    "Optimierte Parameter ergeben S0 <= 0 (I0/E0 >= N) — "
+                    "kein gültiger Startzustand für die Simulation."
+                )
+            args = build_args(model_func, beta_params, beta_mode, SIGMA, GAMMA, OMEGA, N_opt)
+            sol = run_model(model_func, y0, t_total, args, tight=True)
+            I_model = extract_I(model_func, sol)
 
-        # ------------------------------------------------------------------
-        # Fehlerberechnung (Testfenster)
-        # ------------------------------------------------------------------
-        I_model_test = I_model[split_idx:]
-        rmse = np.sqrt(mean_squared_error(I_test, I_model_test))
-        mae = mean_absolute_error(I_test, I_model_test)
+            if not np.all(np.isfinite(I_model)):
+                raise RuntimeError(
+                    "Der ODE-Solver lieferte nicht-endliche Werte (NaN/Inf) — "
+                    "evtl. zu extreme optimierte Parameter. Bitte erneut versuchen "
+                    "oder Iterationen/Populationsgröße anpassen."
+                )
 
-        # ------------------------------------------------------------------
-        # R(t) — effektive Reproduktionszahl
-        # ------------------------------------------------------------------
-        S_t = sol[0]
-        beta_t = beta_time(t_total, beta_params, beta_mode)
-        R_t = beta_t / GAMMA * (S_t / N_opt)
+            # --------------------------------------------------------------
+            # Fehlerberechnung (Testfenster)
+            # --------------------------------------------------------------
+            I_model_test = I_model[split_idx:]
+            rmse = np.sqrt(mean_squared_error(I_test, I_model_test))
+            mae = mean_absolute_error(I_test, I_model_test)
 
-        # --- Plot ---
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=dates, y=I_real, mode="markers", name="Rohdaten", opacity=0.4))
-        fig.add_trace(go.Scatter(x=dates, y=I_smooth, mode="lines", name="7-Tage-Mittel"))
-        fig.add_trace(go.Scatter(x=dates, y=I_model, mode="lines", name="Modell", line=dict(color="red", width=3)))
+            # --------------------------------------------------------------
+            # R(t) — effektive Reproduktionszahl
+            # --------------------------------------------------------------
+            S_t = sol[0]
+            beta_t = beta_time(t_total, beta_params, beta_mode)
+            R_t = beta_t / GAMMA * (S_t / N_opt)
 
-        if "yes" in show_rt:
-            fig.add_trace(go.Scatter(x=dates, y=R_t, mode="lines", name="R(t)", yaxis="y2",
-                                      line=dict(color="green", width=3)))
+            # --- Plot ---
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=dates, y=I_real, mode="markers", name="Rohdaten", opacity=0.4))
+            fig.add_trace(go.Scatter(x=dates, y=I_smooth, mode="lines", name="7-Tage-Mittel"))
+            fig.add_trace(go.Scatter(x=dates, y=I_model, mode="lines", name="Modell",
+                                      line=dict(color="red", width=3)))
 
-        cut_date = dates[split_idx]
+            if "yes" in show_rt:
+                fig.add_trace(go.Scatter(x=dates, y=R_t, mode="lines", name="R(t)", yaxis="y2",
+                                          line=dict(color="green", width=3)))
 
-        fig.add_vrect(x0=cut_date, x1=dates[-1], fillcolor="rgba(150,150,150,0.15)", layer="below", line_width=0)
-        fig.add_vline(x=cut_date, line_width=3, line_dash="dash", line_color="black")
-        fig.add_annotation(x=cut_date, y=max(I_real), text="Train → Prognose", showarrow=False,
-                            yshift=20, font=dict(size=14, color="black"), bgcolor="white")
+            cut_date = dates[split_idx]
 
-        fig.update_layout(
-            title=f"{model_type} | β-Modus: {beta_mode} | RMSE={rmse:.1f}  MAE={mae:.1f}",
-            yaxis_title="Infektionen",
-            yaxis2=dict(title="R(t)", overlaying="y", side="right"),
-            template="plotly_dark",
-            hovermode="x unified",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
+            fig.add_vrect(x0=cut_date, x1=dates[-1], fillcolor="rgba(150,150,150,0.15)",
+                          layer="below", line_width=0)
+            fig.add_vline(x=cut_date, line_width=3, line_dash="dash", line_color="black")
+            fig.add_annotation(x=cut_date, y=max(I_real), text="Train → Prognose", showarrow=False,
+                                yshift=20, font=dict(size=14, color="black"), bgcolor="white")
 
-        # ------------------------------------------------------------------
-        # Ergebnis-Panel
-        # ------------------------------------------------------------------
-        beta_str = ", ".join(f"{b:.4f}" for b in beta_params)
-        result_rows = [
-            html.H6("Optimierungsergebnis", className="mt-2"),
-            html.Div(f"N (effektive Population): {N_opt:,.0f}"),
-            html.Div(f"I₀: {I0_opt:,.1f}"),
-        ]
-        if E0_opt is not None:
-            result_rows.append(html.Div(f"E₀: {E0_opt:,.1f}"))
-        result_rows += [
-            html.Div(f"β-Parameter: [{beta_str}]"),
-            html.Div(f"RMSE (Test): {rmse:,.2f}"),
-            html.Div(f"MAE (Test): {mae:,.2f}"),
-            html.Div(f"Laufzeit: {fit_seconds:.1f}s", className="text-muted"),
-        ]
+            fig.update_layout(
+                title=f"{model_type} | β-Modus: {beta_mode} | RMSE={rmse:.1f}  MAE={mae:.1f}",
+                yaxis_title="Infektionen",
+                yaxis2=dict(title="R(t)", overlaying="y", side="right"),
+                template="plotly_dark",
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
 
-        return fig, result_rows
+            # --------------------------------------------------------------
+            # Ergebnis-Panel
+            # --------------------------------------------------------------
+            beta_str = ", ".join(f"{b:.4f}" for b in beta_params)
+            result_rows = [
+                html.H6("Optimierungsergebnis", className="mt-2"),
+                html.Div(f"N (effektive Population): {N_opt:,.0f}"),
+                html.Div(f"I₀: {I0_opt:,.1f}"),
+            ]
+            if E0_opt is not None:
+                result_rows.append(html.Div(f"E₀: {E0_opt:,.1f}"))
+            result_rows += [
+                html.Div(f"β-Parameter: [{beta_str}]"),
+                html.Div(f"RMSE (Test): {rmse:,.2f}"),
+                html.Div(f"MAE (Test): {mae:,.2f}"),
+                html.Div(f"Laufzeit: {fit_seconds:.1f}s", className="text-muted"),
+            ]
+
+            return fig, result_rows
+
+        except Exception as exc:  # noqa: BLE001 - surface any fit/plot failure in the UI
+            print("ERROR during fit/simulation:\n" + traceback.format_exc())
+            err_fig = go.Figure()
+            err_fig.update_layout(
+                template="plotly_dark",
+                annotations=[dict(
+                    text="Fehler bei der Berechnung — Details siehe Panel links / Terminal.",
+                    xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False, font=dict(size=16)
+                )]
+            )
+            error_panel = dbc.Alert(
+                [html.Strong("Fehler bei der Optimierung/Simulation:"),
+                 html.Div(str(exc), className="small mt-1")],
+                color="danger",
+            )
+            return err_fig, error_panel
 
     # =====================================================
     # Callback für Modal
