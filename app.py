@@ -1,307 +1,341 @@
+# =============================================================================
+# COVID-MODEL — CORE METHODOLOGY MODULE
+# Louis Lecas
+#
+# "covid_model_local_Experimental_Beta_Relative_differentialEvolution"
+#
+# This file holds the modelling methodology ONLY: data loading, beta
+# functions, compartmental models (SIR/SEIR/SEIRS), the ODE solver wrapper,
+# and the differential_evolution-based global parameter fit.
+#
+# It is imported as a module by app.py (Dash UI). There is no __main__
+# entry point here on purpose — all interaction happens through the UI.
+#
+# N optimization and global optimization using scipy.optimize.differential_evolution
+# https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.differential_evolution.html
+# =============================================================================
+
 import numpy as np
 import pandas as pd
-from scipy.integrate import odeint
-from scipy.optimize import minimize
-from sklearn.metrics import mean_squared_error, mean_absolute_error
 
-import dash
-import dash_bootstrap_components as dbc
-from dash import dcc, html, Input, Output, State
-import plotly.graph_objects as go
-import webbrowser
+from scipy.integrate import solve_ivp
+from scipy.optimize import differential_evolution
 
-# =====================================================
-# DATEN LADEN
-# =====================================================
-file_path = r"data/Aktuell_Deutschland_SarsCov2_Infektionen_total.csv"
-df = pd.read_csv(file_path, parse_dates=["Meldedatum"])
+# =============================================================================
+# DEFAULT PARAMETER SELECTION
+# These are the defaults used unless overridden by the caller (e.g. the Dash
+# UI sliders). Kept here so the module remains runnable/testable standalone.
+# =============================================================================
 
-# =====================================================
-# SMOOTHING
-# =====================================================
-def smooth_series(data, window=7):
-    return pd.Series(data).rolling(window, center=True, min_periods=1).mean().values
+# Path to the CSV file from the RKI - this one is compressed to only "Anzahl_Fall" category
+# and is quicker, if all the categories are kept it takes much longer
+FILE_PATH = r"data/Aktuell_Deutschland_SarsCov2_Infektionen_total.csv"
 
-# =====================================================
-# DYNAMISCHES BETA
-# =====================================================
-def beta_time(t, b0, b1, b2):
-    return np.clip(b0 + b1*t + b2*t*t, 0, 2)
+# ---- The fixed (non-optimised) epidemiological parameters ----------------------------------------
+#
+# gamma: recovery rate  = 1 / infectious_period  (10-day infectious period)
+#
+#   Plausible average according to:
+#       Byrne, A.W., McEvoy, D., Collins, A.B., Hunt, K., Casey, M., Barber, A., Butler, F., Griffin, J., Lane, E.A., McAloon, C., O'Brien, K., Wall, P., Walsh, K.A. and More, S.J."Inferred duration of infectious period of SARS-CoV-2: rapid scoping review and analysis of available evidence for asymptomatic and symptomatic COVID-19 cases.", 2019, BMJ open, doi:https://doi.org/10.1136/bmjopen-2020-039856.
+#           Accessed 21 May 2026
+#       Drain, P.K., Dalmat, R.R., Hao, L., Bemer, M.J., Budiawan, E., Morton, J.F., Ireton, R.C., Hsiang, T.-Y., Marfatia, Z., Prabhu, R., Woosley, C., Gichamo, A., Rechkina, E., Hamilton, D., Montaño, M., Cantera, J.L., Ball, A.S., Golez, I., Smith, E. and Greninger, A.L. "Duration of viral infectiousness and correlation with symptoms and diagnostic testing in non-hospitalized adults during acute SARS-CoV-2 infection: A longitudinal cohort study.", 2023,  Journal of Clinical Virology, doi:https://doi.org/10.1016/j.jcv.2023.105420.
+#           Accessed 21 May 2026
+#
+# sigma: incubation rate = 1 / incubation_period (5-day incubation, only SEIR/SEIRS)
+#
+#   Plausible estimate according to:
+#       CDC. "Clinical Presentation." COVID-19, 29 Oct. 2024, www.cdc.gov/covid/hcp/clinical-care/covid19-presentation.html#cdc_generic_section_4-incubation-period.
+#           Accessed 21 May 2026.
+#
+# omega: waning rate    = 1 / immunity_duration  (180-day immunity, SEIRS only)
+#
+#   Plausible estimate according to:
+#       Marcotte, Harold, et al. "Immunity to SARS-CoV-2 up to 15 Months after Infection." IScience, vol. 25, no. 2, Feb. 2022, p. 103743, https://doi.org/10.1016/j.isci.2022.103743.
+#           Accessed 11 Nov. 2022.
+#       CDC. "About Reinfection." COVID-19, 15 July 2024, www.cdc.gov/covid/about/reinfection.html.
+#           Accessed 21 May 2026.
+#
 
-# =====================================================
-# MODELLE
-# =====================================================
-def SIR(y, t, b0, b1, b2, gamma, N):
+GAMMA = 1 / 10
+SIGMA = 1 / 5
+OMEGA = 1 / 180
+
+# ---- Population bounds -------------------------------------------------------
+# N represents the *effective interacting population*, not the national total!
+# No start guess as optimizer is Global
+N_MIN = 1_000           # under 1000 would be ridiculous
+N_MAX = 83_000_000      # approx. German population
+
+# ---- Differential evolution settings -----------------------------------------
+# search parameters for optimization (used as UI defaults — can be overridden
+# by the caller for interactive use, since maxiter=5000 is too slow for a
+# live Dash callback)
+DE_MAXITER = 5000
+DE_POPSIZE = 15
+DE_TOL = 1e-12
+DE_SEED = 42
+DE_WORKERS = -1
+DE_POLISH = True       # local L-BFGS-B optimization after global search
+
+
+# =============================================================================
+# DATA LOADING
+# =============================================================================
+
+def load_data(file_path: str = FILE_PATH) -> pd.DataFrame:
+    """Load the RKI case data CSV, parsing the report date column."""
+    return pd.read_csv(file_path, parse_dates=["Meldedatum"])
+
+
+# =============================================================================
+# 7-day SMOOTHING
+# =============================================================================
+
+def smooth_series(data: np.ndarray, window: int = 7) -> np.ndarray:
+    return (
+        pd.Series(data)
+        .rolling(window, center=True, min_periods=1)
+        .mean()
+        .values
+    )
+
+# =============================================================================
+# BETA FUNCTIONS
+# Each function returns the transmission rate beta at time t.
+# =============================================================================
+
+def beta_constant(t, b0):
+    return np.clip(b0, 0, 2)
+
+def beta_linear(t, b0, b1):
+    return np.clip(b0 + b1 * t, 0, 2)
+
+def beta_polynomial(t, b0, b1, b2):
+    return np.clip(b0 + b1 * t + b2 * t ** 2, 0, 2)
+
+def beta_time(t, params, mode: str) -> float:
+    dispatch = {
+        "constant":   beta_constant,
+        "linear":     beta_linear,
+        "polynomial": beta_polynomial,
+    }
+    if mode not in dispatch:
+        raise ValueError(f"Unknown beta mode: {mode!r}")
+    return dispatch[mode](t, *params)
+
+# =============================================================================
+# BETA BOUNDS - very broad
+# Used directly by differential_evolution — no initial guess required.
+# =============================================================================
+
+def get_beta_bounds(beta_mode: str, n: int) -> list:
+
+    bounds_map = {
+        "constant":   [(0, 100)],
+        "linear":     [(0, 100), (-10, 10)],
+        "polynomial": [(0, 100), (-10, 10), (-1, 1)],
+    }
+    return bounds_map[beta_mode]
+
+# =============================================================================
+# COMPARTMENTAL MODELS
+# =============================================================================
+
+def SIR(t, y, beta_params, beta_mode, gamma, N):
     S, I, R = y
-    beta = beta_time(t, b0, b1, b2)
-    dSdt = -beta * S * I / N
-    dIdt = beta * S * I / N - gamma * I
-    dRdt = gamma * I
+    beta  = beta_time(t, beta_params, beta_mode)
+    dSdt  = -beta * S * I / N
+    dIdt  =  beta * S * I / N - gamma * I
+    dRdt  =  gamma * I
     return [dSdt, dIdt, dRdt]
 
-def SEIR(y, t, b0, b1, b2, sigma, gamma, N):
+def SEIR(t, y, beta_params, beta_mode, sigma, gamma, N):
     S, E, I, R = y
-    beta = beta_time(t, b0, b1, b2)
-    dSdt = -beta * S * I / N
-    dEdt = beta * S * I / N - sigma * E
-    dIdt = sigma * E - gamma * I
-    dRdt = gamma * I
+    beta  = beta_time(t, beta_params, beta_mode)
+    dSdt  = -beta * S * I / N
+    dEdt  =  beta * S * I / N - sigma * E
+    dIdt  =  sigma * E - gamma * I
+    dRdt  =  gamma * I
     return [dSdt, dEdt, dIdt, dRdt]
 
-def SEIRS(y, t, b0, b1, b2, sigma, gamma, omega, N):
+def SEIRS(t, y, beta_params, beta_mode, sigma, gamma, omega, N):
     S, E, I, R = y
-    beta = beta_time(t, b0, b1, b2)
-    dSdt = -beta * S * I / N + omega*R
-    dEdt = beta * S * I / N - sigma*E
-    dIdt = sigma*E - gamma*I
-    dRdt = gamma*I - omega*R
+    beta  = beta_time(t, beta_params, beta_mode)
+    dSdt  = -beta * S * I / N + omega * R
+    dEdt  =  beta * S * I / N - sigma * E
+    dIdt  =  sigma * E - gamma * I
+    dRdt  =  gamma * I - omega * R
     return [dSdt, dEdt, dIdt, dRdt]
 
-# =====================================================
-# PARAMETER FIT
-# =====================================================
-def fit_parameters(model_func, y0, t_train, I_train, N, sigma=0, gamma=1/10, omega=0):
-    def loss(params):
-        b0,b1,b2 = params
+MODEL_MAP = {"SIR": SIR, "SEIR": SEIR, "SEIRS": SEIRS}
 
-        if model_func == SIR:
-            sol = odeint(model_func, y0, t_train, args=(b0,b1,b2,gamma,N))
-            I_model = sol[:,1]
-        elif model_func == SEIR:
-            sol = odeint(model_func, y0, t_train, args=(b0,b1,b2,sigma,gamma,N))
-            I_model = sol[:,2]
-        else:
-            sol = odeint(model_func, y0, t_train, args=(b0,b1,b2,sigma,gamma,omega,N))
-            I_model = sol[:,2]
+# =============================================================================
+# HELPERS
+# =============================================================================
 
-        scale = max(I_train)/(max(I_model)+1e-6)
-        I_model *= scale
-        return np.mean((I_model - I_train)**2)
+def build_args(model_func, beta_params, beta_mode, sigma, gamma, omega, N):
+    """Putting model arguments in the order expected by each model function because they are all different."""
+    if model_func is SIR:
+        return (beta_params, beta_mode, gamma, N)
+    elif model_func is SEIR:
+        return (beta_params, beta_mode, sigma, gamma, N)
+    else:  # this one is then SEIRS
+        return (beta_params, beta_mode, sigma, gamma, omega, N)
 
-    res = minimize(loss, x0=[0.4,0,0], bounds=[(0,2),(-0.05,0.05),(-0.001,0.001)])
-    return res.x
-
-# =====================================================
-# DASH APP
-# =====================================================
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
-server = app.server
-
-app.layout = dbc.Container(fluid=True, children=[
-
-    # --- Info Modal ---
-    dbc.Modal(
-        [
-            dbc.ModalHeader("Informationen zur Simulation"),
-            dbc.ModalBody(
-                dbc.Container(
-                "PLACEHOLDER: Hier steht ein ausführlicher erläuternder Fließtext über das Modell, "
-                "Parameter, Datenbasis, R(t) und Hinweise zur Interpretation. "
-                "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 10,  # Platzhaltertext
-                style={"maxHeight": "60vh", "overflowY": "auto"}  # Scrollbar
-                )
-            ),
-            dbc.ModalFooter(
-                dbc.Button("Schließen", id="close_info", n_clicks=0)
-            ),
-        ],
-        id="modal_info",
-        is_open=False
-    ),
-
-    # --- Überschrift ---
-    dbc.Row(dbc.Col(html.H2("Dynamisches Modell COVID (Deutschland gesamt)", className="text-center my-3"))),
-
-    # --- Haupt-Layout ---
-    dbc.Row([
-
-        # Sidebar
-        dbc.Col([
-            dbc.Card([
-                dbc.CardBody([
-
-                    html.Label("Zeitraum"),
-                    dcc.DatePickerRange(
-                        id="date_range",
-                        start_date=df["Meldedatum"].min(),
-                        end_date=df["Meldedatum"].max()
-                    ),
-
-                    html.Br(),
-                    html.Label("Modelltyp"),
-                    dcc.RadioItems(
-                        id="model_type",
-                        options=["SIR","SEIR","SEIRS"],
-                        value="SEIR",
-                        inline=True
-                    ),
-
-                    html.Br(),
-                    html.Label("Fit Datenbasis"),
-                    dcc.RadioItems(
-                        id="fit_mode",
-                        options=[{"label":"Rohdaten","value":"raw"},
-                                 {"label":"7-Tage-Mittel","value":"smooth"}],
-                        value="smooth",
-                        inline=True
-                    ),
-
-                    html.Br(),
-                    html.Label("Population"),
-                    dcc.Slider(id="population", min=1000, max=83000000, step=1000, value=83000),
-                    html.Div(id="population_value", style={"marginBottom":"10px"}),  # Wert anzeigen
-
-                    html.Br(),
-                    html.Label("I₀"),
-                    dcc.Slider(id="I0", min=0, max=10000, step=10, value=100),
-                    html.Div(id="I0_value", style={"marginBottom":"10px"}),  # Wert anzeigen
-
-                    html.Br(),
-                    html.Label("Train Split (%)"),
-                    dcc.Slider(id="split_ratio", min=10, max=90, step=5, value=70),
-
-                    html.Br(),
-                    html.Label("R(t) anzeigen"),
-                    dcc.Checklist(
-                        id="show_rt",
-                        options=[{"label": "Ja", "value": "yes"}],
-                        value=[],  # leer = standardmäßig aus
-                        inline=True
-                    ),
-
-                    html.Br(),
-                    dbc.Button("Info zur Simulation", id="open_info", n_clicks=0, color="info"),
-
-                ])
-            ])
-        ], width=3),
-
-        # Plot
-        dbc.Col(dcc.Graph(id="simulation_plot"), width=9)
-
-    ])
-])
-
-# =====================================================
-# Callback für Simulation Plot
-# =====================================================
-@app.callback(
-    Output("simulation_plot","figure"),
-    Input("date_range","start_date"),
-    Input("date_range","end_date"),
-    Input("model_type","value"),
-    Input("population","value"),
-    Input("I0","value"),
-    Input("split_ratio","value"),
-    Input("fit_mode","value"),
-    Input("show_rt", "value")
-)
-def update_simulation(start,end,model_type,N,I0,split_ratio,fit_mode,show_rt):
-
-    # Daten filtern
-    df_period = df[(df["Meldedatum"]>=start) & (df["Meldedatum"]<=end)]
-    daily = df_period.groupby("Meldedatum")["AnzahlFall"].sum().sort_index()
-    dates = daily.index
-    I_real = daily.values
-
-    if len(I_real)<30:
-        return go.Figure()
-
-    # 7-Tage-Mittel
-    I_smooth = smooth_series(I_real,7)
-    I_used = I_smooth if fit_mode=="smooth" else I_real.copy()
-
-    # Split Train/Test
-    split_idx = int(len(I_real)*split_ratio/100)
-    I_train = I_used[:split_idx]
-    I_test  = I_real[split_idx:]
-
-    t_train = np.arange(len(I_train))
-    t_total = np.arange(len(I_real))
-
-    gamma, sigma, omega = 1/10, 1/5, 1/180
-    E0, R0 = 2*I0, 0
-    S0 = N-I0-E0
-
-    model_map = {"SIR":SIR,"SEIR":SEIR,"SEIRS":SEIRS}
-    y0 = [S0,I0,R0] if model_type=="SIR" else [S0,E0,I0,R0]
-    model_func = model_map[model_type]
-
-    b0,b1,b2 = fit_parameters(model_func,y0,t_train,I_train,N,sigma,gamma,omega)
-
-    # Simulation
-    if model_type=="SIR":
-        sol = odeint(SIR,y0,t_total,args=(b0,b1,b2,gamma,N))
-        I_model = sol[:,1]
+def build_initial_conditions(model_func, N, I0, E0, R0_init=0):
+    """
+    Create starting conditions (y0) such that S0 = N - E0 - I0 - R0.
+    Returns None if it doesn't work (S0 <= 0).
+    """
+    if model_func is SIR:
+        S0 = N - I0 - R0_init
+        return [S0, I0, R0_init] if S0 > 0 else None
     else:
-        sol = odeint(model_func,y0,t_total,
-                     args=(b0,b1,b2,sigma,gamma,N) if model_type=="SEIR" else
-                          (b0,b1,b2,sigma,gamma,omega,N))
-        I_model = sol[:,2]
+        S0 = N - (E0 or 0) - I0 - R0_init
+        return [S0, E0, I0, R0_init] if S0 > 0 else None
 
-    # Skalierung
-    scale = max(I_train)/(max(I_model[:split_idx])+1e-6)
-    I_model *= scale
+def extract_I(model_func, solution: np.ndarray) -> np.ndarray:
+    """Return the infectious compartment I from the solvers output (from the array)."""
+    return solution[1] if model_func is SIR else solution[2]
 
-    # Fehlerberechnung
-    rmse = np.sqrt(mean_squared_error(I_test,I_model[split_idx:]))
-    mae = mean_absolute_error(I_test,I_model[split_idx:])
+def run_model(model_func, y0, t_eval, args, tight=False):
+    """Solve the ODE system using RK45."""
+    rtol = 1e-6 if tight else 1e-3  # Tolerance - Error control
+    atol = 1e-8 if tight else 1e-5
+    sol = solve_ivp(
+        fun=lambda t, y: model_func(t, y, *args),
+        t_span=(t_eval[0], t_eval[-1]),
+        y0=y0,
+        t_eval=t_eval,
+        method="RK45",
+        rtol=rtol,
+        atol=atol,
+    )
+    return sol.y
 
-    # R(t)
-    R_t = beta_time(t_total,b0,b1,b2)/gamma
+# =============================================================================
+# PARAMETER FITTING — GLOBAL OPTIMISATION
+#
+# Optimizer: Differential Evolution
+# ----------------------------
+# L-BFGS-B is a local gradient-based method and is highly sensitive to its
+# starting point. When the loss "landscape" (n-dimensional representation of loss) is multimodal (with many peaks as is typical with
+# combined beta / N / I0 optimisation), it can converge to very bad
+# local minima depending on the initial guess — making the result
+# unreliable and reducing it's utility for this specific scenario.
+#
+# differential_evolution uses a population of candidate solutions and
+# explores the parameter space without requiring an initial guess.
+# This removes the need for heuristics such as the ridiculous "N_start = 5 × max(I)", replaced with N as an additional optimized Parameter.
+#
+# On N
+# ----------
+# N is the *effective interacting population* — the sub-population within which
+# the epidemic actually spreads. It is NOT the national total.
+# =============================================================================
 
-    # --- Plot ---
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=dates, y=I_real, mode="markers", name="Rohdaten", opacity=0.4))
-    fig.add_trace(go.Scatter(x=dates, y=I_smooth, mode="lines", name="7-Tage-Mittel"))
-    fig.add_trace(go.Scatter(x=dates, y=I_model, mode="lines", name="Modell", line=dict(color="red", width=3)))
+def fit_parameters(model_func, t_train, I_train, beta_mode,
+                    sigma=SIGMA, gamma=GAMMA, omega=OMEGA,
+                    n_min=N_MIN, n_max=N_MAX,
+                    de_maxiter=DE_MAXITER, de_popsize=DE_POPSIZE,
+                    de_tol=DE_TOL, de_seed=DE_SEED,
+                    de_workers=DE_WORKERS, de_polish=DE_POLISH,
+                    progress_callback=None):
+    """
+    Fit beta/N/I0(/E0) parameters via global optimisation (differential_evolution).
 
-    if "yes" in show_rt:
-        fig.add_trace(go.Scatter(x=dates, y=R_t, mode="lines", name="R(t)", yaxis="y2", line=dict(color="green", width=3)))
+    progress_callback: optional callable(intermediate_result) -> None,
+    forwarded to differential_evolution's `callback` kwarg so a caller
+    (e.g. a Dash app) can report progress during a long-running fit.
+    """
 
-    cut_date = dates[split_idx]
+    n         = len(t_train)
+    R0_init   = 0  # No initial Recovered
+    beta_bnds = get_beta_bounds(beta_mode, n)
 
-    # Prognosebereich
-    fig.add_vrect(x0=cut_date, x1=dates[-1], fillcolor="rgba(150,150,150,0.15)", layer="below", line_width=0)
-    fig.add_vline(x=cut_date, line_width=3, line_dash="dash", line_color="black")
-    fig.add_annotation(x=cut_date, y=max(I_real), text="Train → Prognose", showarrow=False, yshift=20, font=dict(size=14,color="black"), bgcolor="white")
+    # Build the full bounds vector depending on model type:
+    #   [*beta_bounds, N_bound, I0_bound]            — SIR
+    #   [*beta_bounds, N_bound, I0_bound, e0_factor] — SEIR/SEIRS
+    #
+    # e0_factor: E0 = e0_factor * I0 (ratio avoids hard-coding E0, but is kind of still super heuristic)
+    #
+    # I0 upper bound is set to half of n_max rather than n_max itself, because otherwise the model doesn't work anyways.
+    # (Also so that the polishing step with L-BFGS-B cannot push I0 above N in the final result.)
+    I0_MAX = n_max * 0.5
+    if model_func is SIR:
+        bounds = beta_bnds + [(n_min, n_max), (1, I0_MAX)]
+    else:
+        bounds = beta_bnds + [(n_min, n_max), (1, I0_MAX), (0.0, 5.0)]
 
-    fig.update_layout(title=f"{model_type} | RMSE={rmse:.1f} MAE={mae:.1f}",
-                      yaxis_title="Infektionen",
-                      yaxis2=dict(title="R(t)",overlaying="y",side="right"),
-                      template="plotly_dark",
-                      hovermode="x unified")
-    return fig
+    # bounds here are : Beta stuff, N, I0 and E0-factor (No R because set to 0)
 
-# =====================================================
-# Callback für Modal
-# =====================================================
-@app.callback(
-    Output("modal_info","is_open"),
-    Input("open_info","n_clicks"),
-    Input("close_info","n_clicks"),
-    State("modal_info","is_open")
-)
-def toggle_modal(n1,n2,is_open):
-    if n1 or n2:
-        return not is_open
-    return is_open
+    # ------------------------------------------------------------------
+    # Loss function: Mean Squared Error between model I(t) and RKI
+    # ------------------------------------------------------------------
+    def loss(params):
+        if model_func is SIR:
+            *beta_params, N_opt, I0 = params
+            E0 = None
+        else:
+            *beta_params, N_opt, I0, e0_factor = params
+            E0 = e0_factor * I0
 
-# =====================================================
-# Callback für Population- und I₀-Werteanzeige
-# =====================================================
-@app.callback(
-    Output("population_value","children"),
-    Output("I0_value","children"),
-    Input("population","value"),
-    Input("I0","value")
-)
-def update_slider_labels(pop, I0):
-    return f"Population: {pop:,}", f"I₀: {I0:,}"
+        if I0 >= N_opt:
+            return 1e12  # infeasible
 
+        y0_local = build_initial_conditions(model_func, N_opt, I0, E0, R0_init)
+        if y0_local is None:
+            return 1e12
 
-# =====================================================
-if __name__=="__main__":
-    url="http://127.0.0.1:8050/"
-    webbrowser.open(url)
-    app.run(debug=True)
+        args = build_args(
+            model_func, tuple(beta_params), beta_mode,
+            sigma, gamma, omega, N_opt
+        )
+        sol     = run_model(model_func, y0_local, t_train, args, tight=False)
+        I_model = extract_I(model_func, sol)
+        return np.mean((I_model - I_train) ** 2)
+
+    # ------------------------------------------------------------------
+    # Global search with optional local polishing
+    # ------------------------------------------------------------------
+    de_kwargs = dict(
+        bounds        = bounds,
+        maxiter       = de_maxiter,
+        popsize       = de_popsize,
+        tol           = de_tol,
+        seed          = de_seed,
+        workers       = de_workers,
+        polish        = de_polish,    # local L-BFGS-B applied on best result
+        mutation      = (0.5, 1.5),   # The mutation constant. In the literature this is also known as differential weight.
+                                       # If specified as a float it should be in the range [0, 2). If specified as a tuple (min, max) dithering is employed.
+                                       # Dithering randomly changes the mutation constant on a generation by generation basis. The mutation constant for that generation is taken from U[min, max).
+                                       # Dithering can help speed convergence significantly. Increasing the mutation constant increases the search radius, but will slow down convergence.
+        recombination = 0.9,
+    )
+    if progress_callback is not None:
+        de_kwargs["callback"] = progress_callback
+
+    result = differential_evolution(loss, **de_kwargs)
+
+    # ------------------------------------------------------------------
+    # Unpacking optimised parameters
+    # The local polishing step (L-BFGS-B) could push values
+    # outside the bounds, so a clamp stops that.
+    # ------------------------------------------------------------------
+    if model_func is SIR:
+        *beta_params, N_opt, I0_opt = result.x
+        E0_opt = None
+    else:
+        *beta_params, N_opt, I0_opt, e0_factor_opt = result.x
+        e0_factor_opt = float(np.clip(e0_factor_opt, 0.0, 5.0))
+        E0_opt        = e0_factor_opt * I0_opt
+
+    # Ensure I0 (+ E0 for SEIR/SEIRS) leaves room for S0 > 0
+    overhead = I0_opt + (E0_opt if E0_opt is not None else 0.0)
+    if overhead >= N_opt:
+        scale  = (N_opt - 1.0) / overhead
+        I0_opt = I0_opt * scale
+        if E0_opt is not None:
+            E0_opt = E0_opt * scale
+
+    return np.array(beta_params), N_opt, I0_opt, E0_opt
