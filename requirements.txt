@@ -7,4 +7,3 @@ scikit-learn
 plotly
 gunicorn
 requests
-diskcache
