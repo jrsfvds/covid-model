@@ -10,9 +10,8 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 import dash
 import dash_bootstrap_components as dbc
-from dash import dcc, html, Input, Output, State, callback_context, DiskcacheManager
+from dash import dcc, html, Input, Output, State, callback_context
 import plotly.graph_objects as go
-import diskcache
 import webbrowser
 
 # =====================================================
@@ -319,33 +318,7 @@ def fit_parameters(model_func, t_train, I_train, beta_mode,
 def _build_app():
     """Build and return (app, server). May raise — caller handles fallback."""
 
-    # -------------------------------------------------
-    # BACKGROUND CALLBACK MANAGER
-    # -------------------------------------------------
-    # The differential_evolution fit can legitimately take from a few
-    # seconds up to several minutes depending on the maxiter/popsize
-    # sliders. Running it inline inside a normal callback blocks the HTTP
-    # request for that whole duration — on a production WSGI server
-    # (gunicorn etc.) the worker gets killed once it exceeds the server's
-    # request timeout (commonly ~30s), which looks to the user like the
-    # page silently "reverting" with no error shown.
-    #
-    # DiskcacheManager runs the callback in a separate forked process; the
-    # HTTP request returns immediately and the frontend polls for the
-    # result, so no request-timeout ever applies to the optimisation
-    # itself. This relies on the OS "fork" start method (default on Linux,
-    # e.g. Render/Heroku/most containers) to share the running process's
-    # memory — it will NOT work with Python's "spawn" start method
-    # (default on Windows/macOS) because update_simulation is a nested
-    # closure, not a top-level/picklable function.
-    cache = diskcache.Cache("./cache")
-    background_callback_manager = DiskcacheManager(cache)
-
-    app = dash.Dash(
-        __name__,
-        external_stylesheets=[dbc.themes.FLATLY],
-        background_callback_manager=background_callback_manager,
-    )
+    app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
     server = app.server
 
     # -------------------------------------------------
@@ -492,10 +465,6 @@ def _build_app():
                         dbc.Button("Optimierung starten", id="run_optimization",
                                    n_clicks=0, color="primary", className="w-100"),
 
-                        dbc.Button("Abbrechen", id="cancel_optimization",
-                                   n_clicks=0, color="danger", outline=True,
-                                   className="w-100 mt-2", disabled=True),
-
                         html.Br(), html.Br(),
                         dbc.Button("Info zur Simulation", id="open_info",
                                    n_clicks=0, color="info", outline=True, className="w-100"),
@@ -536,13 +505,6 @@ def _build_app():
         State("show_rt", "value"),
         State("de_maxiter", "value"),
         State("de_popsize", "value"),
-        background=True,
-        running=[
-            (Output("run_optimization", "disabled"), True, False),
-            (Output("run_optimization", "children"), "Optimierung läuft…", "Optimierung starten"),
-            (Output("cancel_optimization", "disabled"), False, True),
-        ],
-        cancel=[Input("cancel_optimization", "n_clicks")],
         prevent_initial_call=False,
     )
     def update_simulation(n_clicks, start, end, model_type, beta_mode,
